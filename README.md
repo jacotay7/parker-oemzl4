@@ -139,42 +139,94 @@ Decoded from the Hardware Reference's model-number table:
 | Special feedback / serial encoder / MACRO | `00` `0` `0` | None |
 | Communications | `0` | **No options — default** |
 
-### Use Ethernet, not the USB cable
+### Talking to it: USB works, Ethernet does not
 
-The final `0` means **this unit has no RS-232 port** — that is an ordering option
-(`R`, `E`, `N`, `T`) this unit was not built with. It has exactly two host interfaces:
-**X13 USB 2.0** and **X14 RJ45 Ethernet, 100 Base-T**.
+The final `0` in the model number means **no RS-232 port** was fitted, leaving
+**X13 USB 2.0** and **X14 RJ45 Ethernet**. In practice only USB is usable here.
 
-The USB port is a dead end on a Mac. Delta Tau's USB is a vendor-specific device, not
-USB-CDC, so it presents no serial port and needs their `PMACUSB.SYS` kernel driver —
-which the ACC-54E manual scopes to "Windows 98, Windows ME, Windows 2000 and in the
-future Windows XP". Nothing exists for macOS. Moving that cable to the Mac will not
-produce a `/dev/cu.*` node.
+**Ethernet is silent.** The link negotiates (100baseTX full duplex), but the
+controller answers nothing: no reply on Delta Tau's factory default 192.6.94.5,
+no ARP response anywhere on 192.6.94.0/24, and not one unsolicited packet in
+minutes of listening. Its stored IP is unknown and it announces nothing, so
+there is no way to find it by listening. Not worth pursuing while USB works.
 
-**Ethernet is fully documented and needs no driver at all.** Per the ACC-54E manual,
-the controller listens on **UDP or TCP port 1025**, and every exchange is one
-`ETHERNETCMD` packet:
+**USB works, with no Delta Tau driver.** The controller enumerates as:
 
-```c
-typedef struct tagEthernetCmd {
-    BYTE RequestType;    // VR_UPLOAD 0xC0 (read) / VR_DOWNLOAD 0x40 (write)
-    BYTE Request;        // VR_PMAC_GETRESPONSE 0xBF, VR_PMAC_SENDLINE 0xB0,
-                         // VR_PMAC_GETLINE 0xB1, VR_PMAC_FLUSH 0xB3, ...
-    WORD wValue;         // network byte order
-    WORD wIndex;
-    WORD wLength;
-    BYTE bData[1492];
-} ETHERNETCMD;
+```
+0x0aa2:0x0007  Delta Tau Data Systems, Inc.  "ACC54E USB2"
+  interface 0, class 255 (vendor-specific)
+  bulk 0x01 OUT / 0x81 IN (64B);  0x02, 0x04 OUT / 0x86, 0x88 IN (512B)
 ```
 
-`VR_PMAC_GETRESPONSE` (0xBF) sends a command string and returns the reply, reading up
-to an `<ACK>` or `<LF>`. That is the whole request/response cycle a library needs, and
-it is implementable in pure Python with the standard `socket` module — no drivers, no
-kernel extensions, no App Store detour. Delta Tau's factory default address is
-**192.6.94.5** (worth confirming against however this unit was commissioned).
+Interface class 255 means macOS has no driver for it and never claims it, which
+leaves it free for `libusb`. Delta Tau's `PMACUSB.SYS` is only needed by their
+own Windows software, not by the protocol.
 
-That makes this a materially easier target than the AR-04AE, which needed a Prolific
-kext approved by hand before it would enumerate.
+The bulk endpoints are a red herring. The `ETHERNETCMD` struct in the ACC-54E
+manual -- `RequestType`, `Request`, `wValue`, `wIndex`, `wLength` -- is exactly a
+USB control setup packet, because Delta Tau reused USB's framing for their
+Ethernet protocol. Over USB these are **control transfers**:
+
+```
+SENDLINE  bmRequestType 0x40, bRequest 0xB0, data = command + "\r"
+GETLINE   bmRequestType 0xC0, bRequest 0xB1, returns the reply
+```
+
+Three behaviours are not in any manual and cost real time to find:
+
+1. **`GETLINE` returns a NUL byte when nothing is ready.** It does not block and
+   does not return a zero-length transfer, so the caller must poll for data.
+2. **The `<ACK>` that terminates a reply arrives on a later read than the reply
+   text.** Stop reading early and the ACK stays queued, where it is mistaken for
+   the next command's reply -- every command after it returns the previous
+   command's answer, with the lag growing.
+3. **Never issue `GETLINE` while no command is pending.** Draining the queue
+   before sending wedges the device: every subsequent reply comes back empty.
+   Keep sync by ignoring a bare leftover `<ACK>` instead.
+
+Setup, once:
+
+```bash
+brew install libusb
+python3 -m pip install pyusb
+python3 tools/pmac.py            # read-only survey
+python3 tools/pmac.py "#1P"      # ad-hoc query
+```
+
+### Controller state as found (3 Sep 2026)
+
+Read over USB with `tools/pmac.py`, before any change was made:
+
+| Query | Value | Meaning |
+| --- | --- | --- |
+| `VERSION` | `1.947` | Turbo PMAC firmware |
+| `TYPE` | `TURBO2, X4` | Turbo PMAC2 |
+| `#1?` | `850000000000` | activated, **amplifier disabled, open loop** |
+| `#1P` / `#1V` / `#1F` | `-5797.53` / `0` / `0` | stopped, no following error |
+| `I5` | `0` | **all PLC programs disabled** |
+| `I100` / `I101` | `1` / `0` | motor 1 active, commutation off |
+| `I102` | `$78002` | output = servo IC 0, channel 1, **C register** |
+| `I103` / `I104` | `$3501` / `$3501` | feedback from encoder conversion table |
+| `I111` / `I130` / `I169` | `32000` / `2000` / `20480` | fatal following error, gain, output limit |
+| `I7010` | `7` | channel 1 encoder decode |
+| `I7016` | `0` | **A & B PWM, C PWM** |
+| `I7002` / `I7004` | `3` / `15` | PFM clock divider, pulse width |
+
+**The controller is running factory defaults.** `I111=32000`, `I130=2000`,
+`I169=20480`, `I7016=0`, `I102=$78002` and `I103/I104=$3501` are all the Turbo
+PMAC2 power-on values for motor 1, and `I5=0` means no PLC is running. There is
+no commissioned machine configuration on this unit -- nothing was preserved to
+lose, and nothing here was set up for this stepper axis.
+
+**That explains the runaway.** Motor 1 commands `$78002`, the channel 1 C
+output, but `I7016=0` leaves C in **PWM** mode. PWM is a continuous carrier, not
+pulses proportional to commanded velocity. Fed into the OEMZL4's STEP input it
+reads as an endless, constant-rate step train, so the motor runs continuously
+regardless of what motion is commanded. For step and direction the C output must
+be PFM, which is `I7016 = 2` (A & B PWM) or `3` (A & B DAC).
+
+This is a hypothesis consistent with every reading taken so far, not yet a
+confirmed fix -- it has not been tested against the drive.
 
 ### How the Brick reaches the OEMZL4
 
