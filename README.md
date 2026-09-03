@@ -188,14 +188,17 @@ Setup, once:
 
 ```bash
 brew install libusb
-python3 -m pip install pyusb
-python3 tools/pmac.py            # read-only survey
-python3 tools/pmac.py "#1P"      # ad-hoc query
+python3 -m pip install -e .
+
+python3 -m turbo_pmac probe            # identify and survey
+python3 -m turbo_pmac status 1         # decode motor status bits
+python3 -m turbo_pmac send "#1P" I130  # raw queries
+python3 -m turbo_pmac estop            # disable PLCs, then kill all motors
 ```
 
 ### Controller state as found (3 Sep 2026)
 
-Read over USB with `tools/pmac.py`, before any change was made:
+Read over USB with `python3 -m turbo_pmac probe`, before any change was made:
 
 | Query | Value | Meaning |
 | --- | --- | --- |
@@ -241,6 +244,59 @@ the two are a native electrical match.
 cannot do — it has no feedback input. Worth confirming before changing anything, since
 it means the axis may be configured as a closed-loop stepper rather than open-loop.
 
+## Packages
+
+Two packages, deliberately separate so the controller half is reusable on any
+Turbo PMAC:
+
+### `turbo_pmac` — the controller library
+
+Knows nothing about the OEMZL4, or about any particular machine.
+
+| Module | Contents |
+| --- | --- |
+| `transport.py` | `USBTransport` (libusb, verified) and `EthernetTransport` (untested) |
+| `protocol.py` | `ETHERNETCMD` framing, `VR_*` request codes, control characters |
+| `controller.py` | `PMAC`: command dispatch, variables, `emergency_stop()` |
+| `motor.py` | `Motor`: position, velocity, status, kill, jog, home |
+| `status.py` | `MotorStatus`, decoding all 39 status bits from the SRM tables |
+| `response.py` | Reply parsing: hex `$` values, status words, error codes |
+| `errors.py` | Typed exceptions, with the manual's `ERRnnn` meanings |
+| `testing.py` | `FakeTransport`, reproducing the real framing quirks |
+
+```python
+from turbo_pmac import PMAC
+
+with PMAC() as pmac:
+    print(pmac.version)                       # '1.947'
+    motor = pmac.motor(1)
+    print(motor.status.summary())             # 'killed (outputs disabled)'
+    print(motor.position, motor.following_error)
+```
+
+### `parker_oemzl4` — the drive
+
+Reference data from the manuals (pinout, signal specs, DIP switch tables) plus
+`OEMZL4Axis`, which adds the drive's limits to a controller motor. Because the
+drive cannot be asked anything, its resolution has to be told to the library.
+
+```python
+from turbo_pmac import PMAC
+from parker_oemzl4 import OEMZL4Axis
+
+with PMAC() as pmac:
+    axis = OEMZL4Axis(pmac.motor(1), channel=1, resolution=25000)
+    print(axis.check_configuration().report())
+    axis.enable()        # refuses while the channel is still in PWM mode
+```
+
+`check_configuration()` is read-only and is what caught the fault documented
+above. `enable()` will not run an axis that fails it.
+
+```bash
+python3 -m pytest        # 47 tests, no hardware required
+```
+
 ## Manuals
 
 Nine PDFs in two sets under [manuals/](manuals/), indexed at
@@ -260,8 +316,23 @@ downloaded and discarded as belonging to a different product.
 
 ## Next step
 
-Confirm the Brick's IP address and that it answers on port 1025, then build the library
-against `VR_PMAC_GETRESPONSE`. Before commanding motion, read the axis's existing
-configuration out of the controller (`I7mn0`, `I7mn6`, `Ixx30`, and the Ixx8x feedback
-setup) rather than assuming it — whatever commissioned this system already encoded the
-step resolution, ramps and any encoder loop, and that configuration is worth preserving.
+The drive is currently disconnected, and the controller is in a safe state:
+motor 1 is activated but killed, with outputs disabled and the loop open.
+
+Before reconnecting the OEMZL4, `I7016` must be changed from `0` to `2` or `3`
+so the channel's C output emits PFM instead of a PWM carrier. Nothing else on
+this controller is configured, so that one change is necessary but almost
+certainly not sufficient.
+
+Two things worth doing first:
+
+1. **Look for the original configuration.** The PC that had the USB cable may
+   hold a Pewin project or a saved `.pmc` download from whoever commissioned
+   this. Restoring that beats reconstructing it.
+2. **Decide whether this axis is open or closed loop.** `ENC 1` has a live
+   encoder (the conversion table entry reads a real count), and `I103`/`I104`
+   point at it, but those are also the power-on defaults, so they prove nothing
+   about intent.
+
+Do not `SAVE` while experimenting. Without it every change is lost on reset,
+which is the safer state until the configuration is known good.

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parker-oemzl4"
+version = "0.1.0"
+description = "Turbo PMAC control library, and reference data for the Parker OEMZL4 step motor drive"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyusb>=1.2"]
+
+[project.scripts]
+pmac = "turbo_pmac.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["turbo_pmac*", "parker_oemzl4*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
