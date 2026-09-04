@@ -314,6 +314,71 @@ Each index gives part numbers, revisions and dates, states which documents the
 manufacturers consider applicable to these exact models, and records what was
 downloaded and discarded as belonging to a different product.
 
+## Commissioning progress (4 Sep 2026)
+
+Working, verified on hardware:
+
+- **The runaway is fixed.** `I7016: 0 -> 2` switched channel 1's C output from a
+  PWM carrier to PFM. The axis was creeping at **-725 counts/s while the motor
+  was killed** -- the carrier was turning it in hardware, outside the servo loop
+  entirely. After the change: 0.000 counts of drift.
+- **The amplifier fault was configuration, not wiring.** Two separate things:
+  `I124` bit 23 had the wrong fault polarity for a drive whose fault opto
+  conducts while healthy (`$1` -> `$800001`), and the fault status bit is
+  *latched* -- `kill` does not clear it, only a successful re-enable does.
+- **The axis now closes the loop and holds position**: `amplifier_enabled`,
+  `in_position`, `desired_velocity_zero`, following error 0.
+
+### Blocked: PFM pulses are gated in hardware
+
+Commanded moves produce no motion at all. The controller side is provably
+correct -- the C output command register `Y:$078002` tracks the commanded
+output exactly:
+
+| Command | `Y:$078002` | Motion |
+| --- | --- | --- |
+| `#1O0` | 0 | none |
+| `#1O5` | 262,144 | none |
+| `#1O20` | 1,048,576 | none |
+| `#1O-20` | -1,048,576 | none |
+
+So the pulses are commanded and then blocked. Per the Brick Hardware
+Reference, step and direction exist **only on the X connectors**, and are gated:
+
+> Pin 8 | Stepper Enable #n | **Short pin 8 to pin 4 (5V) to enable stepper
+> output for channel #n**
+
+The `AMP1-AMP8` connectors carry no pulse output whatsoever -- only DAC A/B,
+the amplifier-enable relay, and the amplifier-fault input.
+
+| Brick X1 pin | Signal | OEMZL4 25-pin |
+| --- | --- | --- |
+| 6 | PUL1+ | 1 (STEP+) |
+| 14 | PUL1- | 14 (STEP-) |
+| 5 | DIR1+ | 2 (DIR+) |
+| 13 | DIR1- | 15 (DIR-) |
+| **8 to 4** | **Stepper Enable, shorted to +5 V** | -- |
+
+### Not saved
+
+None of these changes are persisted. **A controller reset restores `I7016=0`
+and the continuous drift returns.** Run `SAVE` only once the configuration is
+known good.
+
+| Variable | As found | Now | Why |
+| --- | --- | --- | --- |
+| `I7016` | 0 | 2 | C output PFM, not a PWM carrier |
+| `I124` | `$1` | `$800001` | amplifier fault polarity |
+| `I111` | 32000 | 2000 | trip faster on a runaway |
+| `I122` | 32 | 1 | slow jog for commissioning |
+| `I113`/`I114` | 0 (disabled) | +/-1500 counts | temporary travel envelope |
+
+### Still to do
+
+Physical units. Converting counts to cm needs one measured move -- command a
+known number of counts, measure the actual travel, and divide. That number
+cannot be derived from either manual.
+
 ## Next step
 
 The drive is currently disconnected, and the controller is in a safe state:
