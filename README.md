@@ -314,90 +314,97 @@ Each index gives part numbers, revisions and dates, states which documents the
 manufacturers consider applicable to these exact models, and records what was
 downloaded and discarded as belonging to a different product.
 
-## Commissioning progress (4 Sep 2026)
+## Commissioning (4 Sep 2026)
 
-Working, verified on hardware:
+The axis now runs under closed-loop control. Four faults were found, **all of
+them configuration** -- the wiring was correct throughout.
 
-- **The runaway is fixed.** `I7016: 0 -> 2` switched channel 1's C output from a
-  PWM carrier to PFM. The axis was creeping at **-725 counts/s while the motor
-  was killed** -- the carrier was turning it in hardware, outside the servo loop
-  entirely. After the change: 0.000 counts of drift.
-- **The amplifier fault was configuration, not wiring.** Two separate things:
-  `I124` bit 23 had the wrong fault polarity for a drive whose fault opto
-  conducts while healthy (`$1` -> `$800001`), and the fault status bit is
-  *latched* -- `kill` does not clear it, only a successful re-enable does.
-- **The axis now closes the loop and holds position**: `amplifier_enabled`,
-  `in_position`, `desired_velocity_zero`, following error 0.
+### 1. `I102` pointed at the wrong register
 
-### Blocked: PFM pulses are gated in hardware
+This was the root cause, and the reason no pulses ever reached the drive.
 
-Commanded moves produce no motion at all. The controller side is provably
-correct -- the C output command register `Y:$078002` tracks the commanded
-output exactly:
+Each PMAC2-style servo IC channel occupies eight addresses: the **A** output at
+base+2, the **C** output at base+4. PFM is emitted from the **C** register only.
+`I102` was `$078002` -- channel 1's *A* output, the DAC/PWM register, which is
+the Turbo PMAC2 factory default. The servo wrote a perfectly correct command
+there every cycle, the PFM circuit read the untouched C register, and not one
+pulse was ever emitted. Nothing reports this: the command register looks right,
+the status is clean, and the axis simply never moves.
 
-| Command | `Y:$078002` | Motion |
-| --- | --- | --- |
-| `#1O0` | 0 | none |
-| `#1O5` | 262,144 | none |
-| `#1O20` | 1,048,576 | none |
-| `#1O-20` | -1,048,576 | none |
+`I102 = $078004` fixed it. `c_output_address()` computes this per channel, and
+`check_configuration()` now rejects any other address.
 
-So the pulses are commanded and then blocked. Per the Brick Hardware
-Reference, step and direction exist **only on the X connectors**, and are gated:
+It also explains the original runaway. With `I7016=0` all three outputs are
+PWM, so C emitted a carrier and the motor ran continuously; switching C to PFM
+silenced it, because C's register was never written.
 
-> Pin 8 | Stepper Enable #n | **Short pin 8 to pin 4 (5V) to enable stepper
-> output for channel #n**
+### 2. `I7016` left the C output as a PWM carrier
 
-The `AMP1-AMP8` connectors carry no pulse output whatsoever -- only DAC A/B,
-the amplifier-enable relay, and the amplifier-fault input.
+`0` -> `2`. A PWM carrier is a constant-rate pulse train to a stepper drive.
 
-| Brick X1 pin | Signal | OEMZL4 25-pin |
-| --- | --- | --- |
-| 6 | PUL1+ | 1 (STEP+) |
-| 14 | PUL1- | 14 (STEP-) |
-| 5 | DIR1+ | 2 (DIR+) |
-| 13 | DIR1- | 15 (DIR-) |
-| **8 to 4** | **Stepper Enable, shorted to +5 V** | -- |
+### 3. Amplifier fault polarity, and a latch
 
-### Not saved
+`I124` bit 23 was set for a drive whose fault opto conducts *while faulted*; the
+OEMZL4's conducts while **healthy**. `$1` -> `$800001`. Separately, the fault
+status bit **latches** -- `kill` does not clear it, only a successful re-enable.
 
-None of these changes are persisted. **A controller reset restores `I7016=0`
-and the continuous drift returns.** Run `SAVE` only once the configuration is
-known good.
+### 4. Inverted feedback polarity
 
-| Variable | As found | Now | Why |
+`+` output produced `-` counts, which would have made the closed loop a
+positive-feedback runaway. `I7010: 7` -> `3` -- the SRM's own advice, *"simply
+change to the other option (e.g. from 7 to 3)"*.
+
+### Measured behaviour
+
+| | |
+| --- | --- |
+| Holding | 0.00 counts drift |
+| 100 / 500 / 3000 count moves | exact, following error 0 |
+| Usable jog speed | up to `I122=8` (8000 counts/msec setting) |
+| Achieved rate | ~5000 counts/s on a 10000-count move |
+| Limit | acceleration, not velocity |
+
+One trap worth recording: a *tightened* `I111=2000` fatal-following-error limit
+tripped instantly on the acceleration transient, which looks exactly like a
+motor stall. At `I111=16000` the same moves run with a peak following error of
+**1**. A protection set too tight is indistinguishable from the fault it guards
+against.
+
+### Working configuration (not yet saved)
+
+| Variable | Default | Now | Why |
 | --- | --- | --- | --- |
+| `I102` | `$078002` | `$078004` | C output -- the only register PFM reads |
 | `I7016` | 0 | 2 | C output PFM, not a PWM carrier |
+| `I7010` | 7 | 3 | feedback direction sense |
 | `I124` | `$1` | `$800001` | amplifier fault polarity |
-| `I111` | 32000 | 2000 | trip faster on a runaway |
-| `I122` | 32 | 1 | slow jog for commissioning |
-| `I113`/`I114` | 0 (disabled) | +/-1500 counts | temporary travel envelope |
+| `I111` | 32000 | 16000 | fatal following error |
+| `I119` | 0.015625 | 0.0625 | jog acceleration |
+| `I122` | 32 | 8 | jog speed |
+| `I113`/`I114` | 0 (off) | +/-30000 counts | travel envelope |
 
-### Still to do
+**A controller reset restores the defaults, which include the runaway.** Run
+`SAVE` once the configuration is trusted.
 
-Physical units. Converting counts to cm needs one measured move -- command a
-known number of counts, measure the actual travel, and divide. That number
-cannot be derived from either manual.
+## Physical units
 
-## Next step
+`OEMZL4Axis` takes `counts_per_cm` and then speaks in real units:
 
-The drive is currently disconnected, and the controller is in a safe state:
-motor 1 is activated but killed, with outputs disabled and the loop open.
+```python
+axis = OEMZL4Axis(pmac.motor(1), channel=1, counts_per_cm=...)
+axis.set_speed(1, "cm/s")
+axis.move_by(1, "cm")
+axis.position("mm")
+```
 
-Before reconnecting the OEMZL4, `I7016` must be changed from `0` to `2` or `3`
-so the channel's C output emits PFM instead of a PWM carrier. Nothing else on
-this controller is configured, so that one change is necessary but almost
-certainly not sufficient.
+`counts_per_cm` is the one number that cannot come from a manual: the drive has
+no communications port to report its microstep resolution, and neither manual
+knows the mechanism. Measure it once:
 
-Two things worth doing first:
+```bash
+python3 tools/calibrate.py --counts 20000
+```
 
-1. **Look for the original configuration.** The PC that had the USB cable may
-   hold a Pewin project or a saved `.pmc` download from whoever commissioned
-   this. Restoring that beats reconstructing it.
-2. **Decide whether this axis is open or closed loop.** `ENC 1` has a live
-   encoder (the conversion table entry reads a real count), and `I103`/`I104`
-   point at it, but those are also the power-on defaults, so they prove nothing
-   about intent.
-
-Do not `SAVE` while experimenting. Without it every change is lost on reset,
-which is the safer state until the configuration is known good.
+It moves a known distance, asks for the measured travel, prints the scale
+factor, and returns to where it started. Longer moves calibrate more accurately,
+since the measurement error is fixed.
