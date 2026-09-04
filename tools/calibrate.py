@@ -6,13 +6,17 @@ communications port so it cannot report its microstep resolution, and nothing
 in either manual knows what mechanism the motor turns. It has to be measured
 once: command a known number of counts, measure the travel, divide.
 
-    python3 tools/calibrate.py                        # interactive, 20000 counts
-    python3 tools/calibrate.py --counts 50000         # a longer, more accurate run
+    python3 tools/calibrate.py                        # interactive, 10000 counts
+    python3 tools/calibrate.py --counts -20000        # NEGATIVE moves the other way
     python3 tools/calibrate.py --counts 20000 --measured 5.2 --unit mm
                                                       # just do the arithmetic
 
-Accuracy comes from a long move: the measurement error is fixed, so doubling
-the distance halves its effect. Use the longest travel you can safely spare.
+A negative --counts moves in the opposite direction. Check which way the axis
+has room before starting: if it is sitting near one end of travel, the move
+must head away from that end.
+
+Accuracy comes from a long move -- the measurement error is fixed, so doubling
+the distance halves its effect -- but only use travel you can actually spare.
 """
 
 from __future__ import annotations
@@ -47,8 +51,8 @@ def report(counts: float, measured: float, unit: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--counts", type=float, default=20000,
-                    help="counts to move (default 20000)")
+    ap.add_argument("--counts", type=float, default=10000,
+                    help="counts to move; negative goes the other way (default 10000)")
     ap.add_argument("--measured", type=float,
                     help="measured travel; skips the move and just computes")
     ap.add_argument("--unit", default="mm", help="unit of --measured (default mm)")
@@ -69,9 +73,13 @@ def main() -> int:
             return 1
 
         start = axis.position_counts
+        heading = "NEGATIVE" if args.counts < 0 else "POSITIVE"
         print(f"position now: {start:,.1f} counts")
-        print(f"\nAbout to move {args.counts:,.0f} counts.")
-        print("Mark the current position, or note the reading on any scale.")
+        print(f"\nAbout to move {args.counts:+,.0f} counts, in the {heading} direction,")
+        print(f"ending near {start + args.counts:,.1f} counts.")
+        print("\nMake sure the axis has room to travel THAT way -- this tool cannot")
+        print("see the mechanism and there are no travel limits configured.")
+        print("\nMark the current position, or note the reading on any scale.")
         try:
             input("Press Enter when ready, or Ctrl-C to abort... ")
         except KeyboardInterrupt:
