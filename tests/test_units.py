@@ -57,3 +57,29 @@ def test_bad_rate_units():
         units.speed_to_counts_per_msec(1, "cm", 5000)
     with pytest.raises(ValueError, match="unknown time unit"):
         units.speed_to_counts_per_msec(1, "cm/fortnight", 5000)
+
+
+def test_machine_constants_are_self_consistent():
+    """The three measurements were taken independently; they must agree."""
+    from parker_oemzl4 import machine as m
+
+    # counts/rev implied by the scale factor and the screw pitch
+    counts_per_rev = m.COUNTS_PER_CM * (m.SCREW_PITCH_MM / 10.0)
+    assert counts_per_rev == pytest.approx(m.ENCODER_COUNTS_PER_REV, rel=0.01)
+
+    # steps/rev implied by the microstep ratio, against the DIP switch setting
+    steps_per_rev = m.ENCODER_COUNTS_PER_REV * m.MICROSTEPS_PER_COUNT
+    assert steps_per_rev == pytest.approx(m.STEPS_PER_REV, rel=0.01)
+
+
+def test_machine_resolution_is_a_real_dip_setting():
+    from parker_oemzl4 import drive, machine
+    assert machine.STEPS_PER_REV in drive.RESOLUTIONS
+
+
+def test_one_cm_at_one_cm_per_second_is_within_the_drive_limit():
+    from parker_oemzl4 import machine, units
+    per_msec = units.speed_to_counts_per_msec(1, "cm/s", machine.COUNTS_PER_CM)
+    assert per_msec == pytest.approx(8.0)
+    step_rate = per_msec * 1000 * machine.MICROSTEPS_PER_COUNT
+    assert step_rate < 2_000_000    # the OEMZL4's ceiling

@@ -14,7 +14,7 @@ which knows nothing about this drive and can be reused on its own.
     ...     print(axis.check_configuration().report())
 """
 
-from . import drive, units
+from . import drive, machine, units
 from .axis import ConfigCheck, OEMZL4Axis, c_output_address
 from .drive import (
     CURRENTS, FAULT_CAUSES, MAX_STEP_RATE_HZ, MIN_PULSE_NS, PINOUT,
@@ -29,6 +29,7 @@ __all__ = [
     "ConfigCheck",
     "drive",
     "units",
+    "machine",
     "c_output_address",
     "PINOUT",
     "PINOUT_CW_CCW",

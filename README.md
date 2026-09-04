@@ -410,44 +410,62 @@ counter zeroes on reset -- after `$$$` the axis read `0.47` rather than the
 `211,185` it held before. Absolute positioning needs a homing routine against a
 reference switch; none is configured.
 
-## Scale
+## Scale — measured
 
-Measured directly, by commanding a fixed open-loop output and counting first the
-controller's own PFM pulses and then the encoder:
+Three independent measurements, which agree:
 
-| | |
-| --- | --- |
-| Motor microsteps per encoder count | **6.2682** |
-| Encoder counts per microstep | 0.1595 |
+| Quantity | Value | How |
+| --- | --- | --- |
+| **Counts per cm** | **8,000** | 20,000 counts moved the stage 25 mm |
+| Motor microsteps per encoder count | 6.2682 | counting the controller's own PFM pulses against the encoder |
+| Encoder | 4,000 counts/rev | implied — a 1000-line encoder with x4 quadrature |
+| Drive resolution | 25,000 steps/rev | implied: 4,000 x 6.2682 = 25,073, and 25,000 is a real DIP setting |
+| Screw pitch | 5 mm/rev | implied: 4,000 counts/rev / 8,000 counts/cm |
 
-If the drive's DIP switches are set to 25,000 steps/rev, that implies **3,988
-encoder counts per motor revolution** -- within 0.3% of a round 4,000, which is
-a 1000-line encoder with x4 quadrature decode. The residual is within the timing
-error of the measurement. Confirm the DIP switch setting to pin this down.
+The scale factor came from a ruler; the microstep ratio came from the
+controller's own hardware counter. They were taken separately and land on
+standard values for a 1000-line encoder and a 5 mm leadscrew, which is the main
+reason to trust them. `tests/test_units.py` asserts they stay consistent.
 
-That still does not give centimetres. Encoder counts per revolution says nothing
-about how far one revolution moves the stage; that depends on the mechanism,
-which neither manual knows.
+Verified on the hardware: a commanded `move_by(-1.0, "cm")` moved **-9.990 mm**,
+and `move_by(+1.0, "cm")` at 1 cm/s moved **+9.997 mm** and returned to the same
+position. About 0.1%.
 
-## Physical units
-
-`OEMZL4Axis` takes `counts_per_cm` and then speaks in real units:
+## Usage
 
 ```python
-axis = OEMZL4Axis(pmac.motor(1), channel=1, counts_per_cm=...)
-axis.set_speed(1, "cm/s")
-axis.move_by(1, "cm")
-axis.position("mm")
+from parker_oemzl4.machine import connect
+
+with connect() as axis:
+    axis.set_speed(1, "cm/s")
+    axis.move_by(1, "cm")           # relative move
+    print(axis.position("mm"))
 ```
 
-`counts_per_cm` is the one number that cannot come from a manual: the drive has
-no communications port to report its microstep resolution, and neither manual
-knows the mechanism. Measure it once:
+`connect()` opens the controller, applies this installation's measured
+constants, and kills the axis on the way out whatever happens, so an exception
+cannot leave the drive energised. All the machine-specific numbers live in
+[parker_oemzl4/machine.py](parker_oemzl4/machine.py) — the one file to change
+for a different rig.
 
-```bash
-python3 tools/calibrate.py --counts 20000
-```
+Units are free-form: `"cm"`, `"mm"`, `"m"`, `"um"`, `"in"`, and rates like
+`"cm/s"` or `"mm/min"`. Speeds are checked against the drive's 2 MHz step-rate
+ceiling, which at 25,000 steps/rev works out to 80 rev/s, or **40 cm/s**.
 
-It moves a known distance, asks for the measured travel, prints the scale
-factor, and returns to where it started. Longer moves calibrate more accurately,
-since the measurement error is fixed.
+For raw work, `axis.move_counts()` needs no scale factor, and the controller
+itself is available through `turbo_pmac` with no knowledge of this drive at all.
+
+## Known limitations
+
+- **No absolute position.** The encoder is incremental and its counter zeroes on
+  every controller reset, so position is relative to power-up. `move_by` is
+  exact; `move_to` means "from wherever it was at power-on". Absolute
+  positioning needs a homing routine against a reference switch, and none is
+  configured. Whether a home or limit switch is even wired to the Brick's `J4`
+  connector is not yet established.
+- **No travel limits.** Hardware overtravel inputs are not known to be wired,
+  and the software limits `I113`/`I114` are disabled. Nothing stops a commanded
+  move from driving into a hard stop. Set real ones once the travel is measured.
+- **Short moves do not reach the commanded speed.** A 1 cm move at 1 cm/s
+  averages about 0.55 cm/s, because acceleration and deceleration dominate at
+  that distance. Raise `I119` if that matters, gently — it is a stepper.
