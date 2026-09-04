@@ -101,5 +101,14 @@ class Motor:
         self.command(f"J^{distance}")
 
     def home(self) -> None:
-        """Start a homing search. This moves the axis."""
+        """Start a homing search against a reference flag. This moves the axis."""
         self.command("HM")
+
+    def home_here(self) -> None:
+        """Zero-move homing: call the present position home. Does not move.
+
+        Per the Software Reference, the motor "calls wherever it is at the time
+        of the command the home position". Useful when no reference switch is
+        wired, which is the only way to get a repeatable datum by hand.
+        """
+        self.command("HOMEZ")

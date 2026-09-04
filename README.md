@@ -1,9 +1,289 @@
 # parker-oemzl4
 
-Notes and (eventually) control code for the **Parker Hannifin / Compumotor OEMZL4**
-step motor drive.
+Control software for a single motion axis: a **Parker Hannifin / Compumotor
+OEMZL4** step motor drive, commanded by a **Delta Tau BC8 Brick Motion
+Controller** (Turbo PMAC2), driven from a Mac over USB.
 
-## Short answer: talk to the Delta Tau, not to the drive
+```
+Mac  ──USB──▶  Delta Tau Brick (Turbo PMAC2)  ──step + direction──▶  OEMZL4  ──▶  motor
+   libusb, no driver          PFM on the C output        25-pin INDEXER, 5 V opto
+```
+
+The axis is commissioned and moves in physical units to about 0.1%. A
+commanded `move_by(1, "cm")` at 1 cm/s travels 9.997 mm and returns to the same
+position.
+
+## Quick start
+
+```bash
+brew install libusb
+python3 -m pip install -e .
+```
+
+```bash
+oemzl4 status          # where it is, and whether it is healthy
+oemzl4 move 1cm        # relative move
+oemzl4 move -5mm --speed 2mm/s
+oemzl4 stop            # kill the output now
+```
+
+```python
+from parker_oemzl4.machine import connect
+
+with connect() as axis:
+    axis.set_speed(1, "cm/s")
+    axis.move_by(1, "cm")
+    print(axis.position("mm"))
+```
+
+The axis is killed on the way out of the `with` block however it ends, so an
+exception cannot leave the drive energised and holding.
+
+## Command line
+
+| Command | Does |
+| --- | --- |
+| `oemzl4 status` | position, speed, state, and the measured scale |
+| `oemzl4 pos --unit mm` | position only, for scripting |
+| `oemzl4 move 1cm` | relative move; `--speed 2mm/s` sets the speed first |
+| `oemzl4 moveto 2cm` | absolute move, relative to the zero reference |
+| `oemzl4 speed 1cm/s` | set the speed |
+| `oemzl4 zero` | call the present position zero, **without moving** |
+| `oemzl4 stop` | kill the axis output immediately |
+| `oemzl4 check` | verify the controller configuration |
+| `pmac probe` | the controller underneath, independent of this drive |
+
+Distances take the unit attached or separate — `1cm`, `-5 mm`, `2.5in` — and
+speeds look like `1cm/s` or `30mm/min`. Units understood: `cm`, `mm`, `m`,
+`um`, `in`, `mil`, with rates per `s` or `min`.
+
+Speeds are checked against the drive's 2 MHz step ceiling, which at 25,000
+steps/rev is 80 rev/s, or **40 cm/s**.
+
+## Python API
+
+```python
+from turbo_pmac import PMAC
+from parker_oemzl4 import OEMZL4Axis
+
+with PMAC() as pmac:
+    axis = OEMZL4Axis(pmac.motor(1), channel=1,
+                      resolution=25_000, counts_per_cm=8_000)
+
+    axis.check_configuration()      # read-only; enable() refuses if it fails
+    axis.enable()
+    axis.move_by(-5, "mm")
+    axis.move_counts(1000)          # raw counts, no scale factor needed
+    axis.set_zero()                 # declare a datum without moving
+    axis.kill()
+```
+
+Anything not wrapped can still be sent directly: `pmac.command("#1P")`.
+
+See [examples/basic_move.py](examples/basic_move.py) for a runnable version.
+
+## Known limitations
+
+- **No absolute position.** The encoder is incremental and its counter zeroes on
+  every controller reset, so position is relative to power-up. `move_by` is
+  exact; `move_to` means "from wherever it was at power-on". Absolute
+  positioning needs a homing routine against a reference switch, and none is
+  configured. Whether a home or limit switch is even wired to the Brick's `J4`
+  connector is not yet established. `oemzl4 zero` declares the present position
+  as zero without moving, which is a workable datum if you set it against a
+  known physical reference.
+- **No travel limits.** Hardware overtravel inputs are not known to be wired,
+  and the software limits `I113`/`I114` are disabled. Nothing stops a commanded
+  move from driving into a hard stop. Set real ones once the travel is measured.
+- **Short moves do not reach the commanded speed.** A 1 cm move at 1 cm/s
+  averages about 0.55 cm/s, because acceleration and deceleration dominate at
+  that distance. Raise `I119` if that matters, gently — it is a stepper.
+
+## Packages
+
+Two packages, deliberately separate so the controller half is reusable on any
+Turbo PMAC:
+
+### `turbo_pmac` — the controller library
+
+Knows nothing about the OEMZL4, or about any particular machine.
+
+| Module | Contents |
+| --- | --- |
+| `transport.py` | `USBTransport` (libusb, verified) and `EthernetTransport` (untested) |
+| `protocol.py` | `ETHERNETCMD` framing, `VR_*` request codes, control characters |
+| `controller.py` | `PMAC`: command dispatch, variables, `emergency_stop()` |
+| `motor.py` | `Motor`: position, velocity, status, kill, jog, home |
+| `status.py` | `MotorStatus`, decoding all 39 status bits from the SRM tables |
+| `response.py` | Reply parsing: hex `$` values, status words, error codes |
+| `errors.py` | Typed exceptions, with the manual's `ERRnnn` meanings |
+| `testing.py` | `FakeTransport`, reproducing the real framing quirks |
+| `cli.py` | `pmac probe / status / send / estop` |
+
+```python
+from turbo_pmac import PMAC
+
+with PMAC() as pmac:
+    print(pmac.version)                       # '1.947'
+    motor = pmac.motor(1)
+    print(motor.status.summary())             # 'killed (outputs disabled)'
+    print(motor.position, motor.following_error)
+```
+
+### `parker_oemzl4` — the drive and this stage
+
+| Module | Contents |
+| --- | --- |
+| `drive.py` | Manual reference data: pinout, signal specs, DIP switch tables |
+| `axis.py` | `OEMZL4Axis`: the drive's limits and units on a controller motor |
+| `units.py` | cm / mm / m / um / in, and rates per second or minute |
+| `machine.py` | **The measured constants for this installation** — the one file to change for a different rig |
+| `cli.py` | the `oemzl4` command |
+
+Because the drive cannot be asked anything, its resolution and scale have to be
+told to the library.
+
+```python
+from turbo_pmac import PMAC
+from parker_oemzl4 import OEMZL4Axis
+
+with PMAC() as pmac:
+    axis = OEMZL4Axis(pmac.motor(1), channel=1, resolution=25000)
+    print(axis.check_configuration().report())
+    axis.enable()        # refuses while the channel is still in PWM mode
+```
+
+`check_configuration()` is read-only, and now catches both faults that made
+this axis dead — a PWM carrier on the C output, and the motor commanding the
+wrong register. `enable()` will not run an axis that fails it.
+
+```bash
+python3 -m pytest        # 80 tests, no hardware required
+```
+
+## Scale — measured
+
+Three independent measurements, which agree:
+
+| Quantity | Value | How |
+| --- | --- | --- |
+| **Counts per cm** | **8,000** | 20,000 counts moved the stage 25 mm |
+| Motor microsteps per encoder count | 6.2682 | counting the controller's own PFM pulses against the encoder |
+| Encoder | 4,000 counts/rev | implied — a 1000-line encoder with x4 quadrature |
+| Drive resolution | 25,000 steps/rev | implied: 4,000 x 6.2682 = 25,073, and 25,000 is a real DIP setting |
+| Screw pitch | 5 mm/rev | implied: 4,000 counts/rev / 8,000 counts/cm |
+
+The scale factor came from a ruler; the microstep ratio came from the
+controller's own hardware counter. They were taken separately and land on
+standard values for a 1000-line encoder and a 5 mm leadscrew, which is the main
+reason to trust them. `tests/test_units.py` asserts they stay consistent.
+
+Verified on the hardware: a commanded `move_by(-1.0, "cm")` moved **-9.990 mm**,
+and `move_by(+1.0, "cm")` at 1 cm/s moved **+9.997 mm** and returned to the same
+position. About 0.1%.
+
+## Saved, and verified across a reset
+
+The working configuration is now in flash. Verified properly, by resetting the
+controller with `$$$` and reading the values back as they loaded:
+
+```
+I102 $78004   I7016 2   I7010 3   I124 $800001
+I111 16000    I119 0.0625   I122 8
+drift after reset: +0.00 counts
+```
+
+**The power-up runaway is gone permanently.** A read-back before the reset would
+only have proved what was in RAM, which is not the thing that matters.
+
+Software travel limits were deliberately left **disabled** (`I113=I114=0`, the
+factory state) rather than persisted. The envelope used during commissioning was
+centred on an arbitrary position; saved, it would have blocked legitimate moves
+later for no discoverable reason. Set real ones once the true travel is known.
+
+**Position is relative to each power-up.** The encoder is incremental and the
+counter zeroes on reset -- after `$$$` the axis read `0.47` rather than the
+`211,185` it held before. Absolute positioning needs a homing routine against a
+reference switch; none is configured.
+
+## Commissioning (4 Sep 2026)
+
+The axis now runs under closed-loop control. Four faults were found, **all of
+them configuration** -- the wiring was correct throughout.
+
+### 1. `I102` pointed at the wrong register
+
+This was the root cause, and the reason no pulses ever reached the drive.
+
+Each PMAC2-style servo IC channel occupies eight addresses: the **A** output at
+base+2, the **C** output at base+4. PFM is emitted from the **C** register only.
+`I102` was `$078002` -- channel 1's *A* output, the DAC/PWM register, which is
+the Turbo PMAC2 factory default. The servo wrote a perfectly correct command
+there every cycle, the PFM circuit read the untouched C register, and not one
+pulse was ever emitted. Nothing reports this: the command register looks right,
+the status is clean, and the axis simply never moves.
+
+`I102 = $078004` fixed it. `c_output_address()` computes this per channel, and
+`check_configuration()` now rejects any other address.
+
+It also explains the original runaway. With `I7016=0` all three outputs are
+PWM, so C emitted a carrier and the motor ran continuously; switching C to PFM
+silenced it, because C's register was never written.
+
+### 2. `I7016` left the C output as a PWM carrier
+
+`0` -> `2`. A PWM carrier is a constant-rate pulse train to a stepper drive.
+
+### 3. Amplifier fault polarity, and a latch
+
+`I124` bit 23 was set for a drive whose fault opto conducts *while faulted*; the
+OEMZL4's conducts while **healthy**. `$1` -> `$800001`. Separately, the fault
+status bit **latches** -- `kill` does not clear it, only a successful re-enable.
+
+### 4. Inverted feedback polarity
+
+`+` output produced `-` counts, which would have made the closed loop a
+positive-feedback runaway. `I7010: 7` -> `3` -- the SRM's own advice, *"simply
+change to the other option (e.g. from 7 to 3)"*.
+
+### Measured behaviour
+
+| | |
+| --- | --- |
+| Holding | 0.00 counts drift |
+| 100 / 500 / 3000 count moves | exact, following error 0 |
+| Usable jog speed | up to `I122=8` (8000 counts/msec setting) |
+| Achieved rate | ~5000 counts/s on a 10000-count move |
+| Limit | acceleration, not velocity |
+
+One trap worth recording: a *tightened* `I111=2000` fatal-following-error limit
+tripped instantly on the acceleration transient, which looks exactly like a
+motor stall. At `I111=16000` the same moves run with a peak following error of
+**1**. A protection set too tight is indistinguishable from the fault it guards
+against.
+
+### Working configuration (not yet saved)
+
+| Variable | Default | Now | Why |
+| --- | --- | --- | --- |
+| `I102` | `$078002` | `$078004` | C output -- the only register PFM reads |
+| `I7016` | 0 | 2 | C output PFM, not a PWM carrier |
+| `I7010` | 7 | 3 | feedback direction sense |
+| `I124` | `$1` | `$800001` | amplifier fault polarity |
+| `I111` | 32000 | 16000 | fatal following error |
+| `I119` | 0.015625 | 0.0625 | jog acceleration |
+| `I122` | 32 | 8 | jog speed |
+| `I113`/`I114` | 0 (off) | +/-30000 counts | travel envelope |
+
+**A controller reset restores the defaults, which include the runaway.** Run
+`SAVE` once the configuration is trusted.
+
+# Reference
+
+Everything below documents the hardware and how the system was
+brought up. None of it is needed for day-to-day use.
+
+## Why there is a controller in the middle
 
 There is no way to talk to the OEMZL4 directly. It has no communications port of any
 kind. In this system the **Delta Tau PMAC is the controller** — it is the thing that
@@ -244,59 +524,6 @@ the two are a native electrical match.
 cannot do — it has no feedback input. Worth confirming before changing anything, since
 it means the axis may be configured as a closed-loop stepper rather than open-loop.
 
-## Packages
-
-Two packages, deliberately separate so the controller half is reusable on any
-Turbo PMAC:
-
-### `turbo_pmac` — the controller library
-
-Knows nothing about the OEMZL4, or about any particular machine.
-
-| Module | Contents |
-| --- | --- |
-| `transport.py` | `USBTransport` (libusb, verified) and `EthernetTransport` (untested) |
-| `protocol.py` | `ETHERNETCMD` framing, `VR_*` request codes, control characters |
-| `controller.py` | `PMAC`: command dispatch, variables, `emergency_stop()` |
-| `motor.py` | `Motor`: position, velocity, status, kill, jog, home |
-| `status.py` | `MotorStatus`, decoding all 39 status bits from the SRM tables |
-| `response.py` | Reply parsing: hex `$` values, status words, error codes |
-| `errors.py` | Typed exceptions, with the manual's `ERRnnn` meanings |
-| `testing.py` | `FakeTransport`, reproducing the real framing quirks |
-
-```python
-from turbo_pmac import PMAC
-
-with PMAC() as pmac:
-    print(pmac.version)                       # '1.947'
-    motor = pmac.motor(1)
-    print(motor.status.summary())             # 'killed (outputs disabled)'
-    print(motor.position, motor.following_error)
-```
-
-### `parker_oemzl4` — the drive
-
-Reference data from the manuals (pinout, signal specs, DIP switch tables) plus
-`OEMZL4Axis`, which adds the drive's limits to a controller motor. Because the
-drive cannot be asked anything, its resolution has to be told to the library.
-
-```python
-from turbo_pmac import PMAC
-from parker_oemzl4 import OEMZL4Axis
-
-with PMAC() as pmac:
-    axis = OEMZL4Axis(pmac.motor(1), channel=1, resolution=25000)
-    print(axis.check_configuration().report())
-    axis.enable()        # refuses while the channel is still in PWM mode
-```
-
-`check_configuration()` is read-only and is what caught the fault documented
-above. `enable()` will not run an axis that fails it.
-
-```bash
-python3 -m pytest        # 47 tests, no hardware required
-```
-
 ## Manuals
 
 Nine PDFs in two sets under [manuals/](manuals/), indexed at
@@ -314,158 +541,3 @@ Each index gives part numbers, revisions and dates, states which documents the
 manufacturers consider applicable to these exact models, and records what was
 downloaded and discarded as belonging to a different product.
 
-## Commissioning (4 Sep 2026)
-
-The axis now runs under closed-loop control. Four faults were found, **all of
-them configuration** -- the wiring was correct throughout.
-
-### 1. `I102` pointed at the wrong register
-
-This was the root cause, and the reason no pulses ever reached the drive.
-
-Each PMAC2-style servo IC channel occupies eight addresses: the **A** output at
-base+2, the **C** output at base+4. PFM is emitted from the **C** register only.
-`I102` was `$078002` -- channel 1's *A* output, the DAC/PWM register, which is
-the Turbo PMAC2 factory default. The servo wrote a perfectly correct command
-there every cycle, the PFM circuit read the untouched C register, and not one
-pulse was ever emitted. Nothing reports this: the command register looks right,
-the status is clean, and the axis simply never moves.
-
-`I102 = $078004` fixed it. `c_output_address()` computes this per channel, and
-`check_configuration()` now rejects any other address.
-
-It also explains the original runaway. With `I7016=0` all three outputs are
-PWM, so C emitted a carrier and the motor ran continuously; switching C to PFM
-silenced it, because C's register was never written.
-
-### 2. `I7016` left the C output as a PWM carrier
-
-`0` -> `2`. A PWM carrier is a constant-rate pulse train to a stepper drive.
-
-### 3. Amplifier fault polarity, and a latch
-
-`I124` bit 23 was set for a drive whose fault opto conducts *while faulted*; the
-OEMZL4's conducts while **healthy**. `$1` -> `$800001`. Separately, the fault
-status bit **latches** -- `kill` does not clear it, only a successful re-enable.
-
-### 4. Inverted feedback polarity
-
-`+` output produced `-` counts, which would have made the closed loop a
-positive-feedback runaway. `I7010: 7` -> `3` -- the SRM's own advice, *"simply
-change to the other option (e.g. from 7 to 3)"*.
-
-### Measured behaviour
-
-| | |
-| --- | --- |
-| Holding | 0.00 counts drift |
-| 100 / 500 / 3000 count moves | exact, following error 0 |
-| Usable jog speed | up to `I122=8` (8000 counts/msec setting) |
-| Achieved rate | ~5000 counts/s on a 10000-count move |
-| Limit | acceleration, not velocity |
-
-One trap worth recording: a *tightened* `I111=2000` fatal-following-error limit
-tripped instantly on the acceleration transient, which looks exactly like a
-motor stall. At `I111=16000` the same moves run with a peak following error of
-**1**. A protection set too tight is indistinguishable from the fault it guards
-against.
-
-### Working configuration (not yet saved)
-
-| Variable | Default | Now | Why |
-| --- | --- | --- | --- |
-| `I102` | `$078002` | `$078004` | C output -- the only register PFM reads |
-| `I7016` | 0 | 2 | C output PFM, not a PWM carrier |
-| `I7010` | 7 | 3 | feedback direction sense |
-| `I124` | `$1` | `$800001` | amplifier fault polarity |
-| `I111` | 32000 | 16000 | fatal following error |
-| `I119` | 0.015625 | 0.0625 | jog acceleration |
-| `I122` | 32 | 8 | jog speed |
-| `I113`/`I114` | 0 (off) | +/-30000 counts | travel envelope |
-
-**A controller reset restores the defaults, which include the runaway.** Run
-`SAVE` once the configuration is trusted.
-
-## Saved, and verified across a reset
-
-The working configuration is now in flash. Verified properly, by resetting the
-controller with `$$$` and reading the values back as they loaded:
-
-```
-I102 $78004   I7016 2   I7010 3   I124 $800001
-I111 16000    I119 0.0625   I122 8
-drift after reset: +0.00 counts
-```
-
-**The power-up runaway is gone permanently.** A read-back before the reset would
-only have proved what was in RAM, which is not the thing that matters.
-
-Software travel limits were deliberately left **disabled** (`I113=I114=0`, the
-factory state) rather than persisted. The envelope used during commissioning was
-centred on an arbitrary position; saved, it would have blocked legitimate moves
-later for no discoverable reason. Set real ones once the true travel is known.
-
-**Position is relative to each power-up.** The encoder is incremental and the
-counter zeroes on reset -- after `$$$` the axis read `0.47` rather than the
-`211,185` it held before. Absolute positioning needs a homing routine against a
-reference switch; none is configured.
-
-## Scale — measured
-
-Three independent measurements, which agree:
-
-| Quantity | Value | How |
-| --- | --- | --- |
-| **Counts per cm** | **8,000** | 20,000 counts moved the stage 25 mm |
-| Motor microsteps per encoder count | 6.2682 | counting the controller's own PFM pulses against the encoder |
-| Encoder | 4,000 counts/rev | implied — a 1000-line encoder with x4 quadrature |
-| Drive resolution | 25,000 steps/rev | implied: 4,000 x 6.2682 = 25,073, and 25,000 is a real DIP setting |
-| Screw pitch | 5 mm/rev | implied: 4,000 counts/rev / 8,000 counts/cm |
-
-The scale factor came from a ruler; the microstep ratio came from the
-controller's own hardware counter. They were taken separately and land on
-standard values for a 1000-line encoder and a 5 mm leadscrew, which is the main
-reason to trust them. `tests/test_units.py` asserts they stay consistent.
-
-Verified on the hardware: a commanded `move_by(-1.0, "cm")` moved **-9.990 mm**,
-and `move_by(+1.0, "cm")` at 1 cm/s moved **+9.997 mm** and returned to the same
-position. About 0.1%.
-
-## Usage
-
-```python
-from parker_oemzl4.machine import connect
-
-with connect() as axis:
-    axis.set_speed(1, "cm/s")
-    axis.move_by(1, "cm")           # relative move
-    print(axis.position("mm"))
-```
-
-`connect()` opens the controller, applies this installation's measured
-constants, and kills the axis on the way out whatever happens, so an exception
-cannot leave the drive energised. All the machine-specific numbers live in
-[parker_oemzl4/machine.py](parker_oemzl4/machine.py) — the one file to change
-for a different rig.
-
-Units are free-form: `"cm"`, `"mm"`, `"m"`, `"um"`, `"in"`, and rates like
-`"cm/s"` or `"mm/min"`. Speeds are checked against the drive's 2 MHz step-rate
-ceiling, which at 25,000 steps/rev works out to 80 rev/s, or **40 cm/s**.
-
-For raw work, `axis.move_counts()` needs no scale factor, and the controller
-itself is available through `turbo_pmac` with no knowledge of this drive at all.
-
-## Known limitations
-
-- **No absolute position.** The encoder is incremental and its counter zeroes on
-  every controller reset, so position is relative to power-up. `move_by` is
-  exact; `move_to` means "from wherever it was at power-on". Absolute
-  positioning needs a homing routine against a reference switch, and none is
-  configured. Whether a home or limit switch is even wired to the Brick's `J4`
-  connector is not yet established.
-- **No travel limits.** Hardware overtravel inputs are not known to be wired,
-  and the software limits `I113`/`I114` are disabled. Nothing stops a commanded
-  move from driving into a hard stop. Set real ones once the travel is measured.
-- **Short moves do not reach the commanded speed.** A 1 cm move at 1 cm/s
-  averages about 0.55 cm/s, because acceleration and deceleration dominate at
-  that distance. Raise `I119` if that matters, gently — it is a stepper.

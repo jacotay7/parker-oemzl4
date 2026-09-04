@@ -252,3 +252,12 @@ class OEMZL4Axis:
     def stop(self) -> None:
         """Decelerate to a stop and hold position."""
         self.motor.stop()
+
+    def set_zero(self) -> None:
+        """Call the present position zero, without moving.
+
+        The encoder is incremental and its counter restarts at every controller
+        reset, so there is no datum until one is declared. Do this at a known
+        physical reference and absolute moves become meaningful.
+        """
+        self.motor.home_here()
