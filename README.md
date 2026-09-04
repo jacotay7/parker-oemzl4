@@ -386,6 +386,49 @@ against.
 **A controller reset restores the defaults, which include the runaway.** Run
 `SAVE` once the configuration is trusted.
 
+## Saved, and verified across a reset
+
+The working configuration is now in flash. Verified properly, by resetting the
+controller with `$$$` and reading the values back as they loaded:
+
+```
+I102 $78004   I7016 2   I7010 3   I124 $800001
+I111 16000    I119 0.0625   I122 8
+drift after reset: +0.00 counts
+```
+
+**The power-up runaway is gone permanently.** A read-back before the reset would
+only have proved what was in RAM, which is not the thing that matters.
+
+Software travel limits were deliberately left **disabled** (`I113=I114=0`, the
+factory state) rather than persisted. The envelope used during commissioning was
+centred on an arbitrary position; saved, it would have blocked legitimate moves
+later for no discoverable reason. Set real ones once the true travel is known.
+
+**Position is relative to each power-up.** The encoder is incremental and the
+counter zeroes on reset -- after `$$$` the axis read `0.47` rather than the
+`211,185` it held before. Absolute positioning needs a homing routine against a
+reference switch; none is configured.
+
+## Scale
+
+Measured directly, by commanding a fixed open-loop output and counting first the
+controller's own PFM pulses and then the encoder:
+
+| | |
+| --- | --- |
+| Motor microsteps per encoder count | **6.2682** |
+| Encoder counts per microstep | 0.1595 |
+
+If the drive's DIP switches are set to 25,000 steps/rev, that implies **3,988
+encoder counts per motor revolution** -- within 0.3% of a round 4,000, which is
+a 1000-line encoder with x4 quadrature decode. The residual is within the timing
+error of the measurement. Confirm the DIP switch setting to pin this down.
+
+That still does not give centimetres. Encoder counts per revolution says nothing
+about how far one revolution moves the stage; that depends on the mechanism,
+which neither manual knows.
+
 ## Physical units
 
 `OEMZL4Axis` takes `counts_per_cm` and then speaks in real units:
