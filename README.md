@@ -541,3 +541,7 @@ Each index gives part numbers, revisions and dates, states which documents the
 manufacturers consider applicable to these exact models, and records what was
 downloaded and discarded as belonging to a different product.
 
+
+## License
+
+MIT. See [LICENSE](LICENSE).
